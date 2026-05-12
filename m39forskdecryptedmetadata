@@ -1751,7 +1751,7 @@ class Runtime {
     }
     loadGlobalMetadata(webData) {
         return __awaiter(this, void 0, void 0, function* () {
-            const metadata = (yield fetch(`https://raw.githubusercontent.com/TJGTA3/rectehoststuff/refs/heads/main/skmetadata.dat?t=${Date.now()}`)).arrayBuffer();
+            const metadata = (yield fetch(`https://raw.githubusercontent.com/Recte-Development/rectehoststuff/refs/heads/main/skmetadata.dat?t=${Date.now()}`)).arrayBuffer();
             if (!metadata) {
                 this.logger.error(new _errors__WEBPACK_IMPORTED_MODULE_1__.UnresolvedMetadataError("Unable to find global-metadata.dat! The game may be encrypted, corrupt or unsupported.").print());
                 return;
