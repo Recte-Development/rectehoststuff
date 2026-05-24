@@ -807,7 +807,7 @@ var __awaiter = (undefined && undefined.__awaiter) || function (thisArg, _argume
 // updating this
 let metadataVer = 0;
 function createIl2CppContext(buffer, metadata, referencedAssemblies) {
-    var _a;
+    var _a, _b;
     console.debug("Creating IL2CPP Context");
     if (!buffer || buffer.byteLength === 0) {
         return (0,neverthrow__WEBPACK_IMPORTED_MODULE_0__.err)(new _errors__WEBPACK_IMPORTED_MODULE_2__.Il2CppContextCreationError("createIl2CppContext: WASM buffer is empty/null"));
@@ -887,6 +887,10 @@ function createIl2CppContext(buffer, metadata, referencedAssemblies) {
     // property checks for the (potentially tens of thousands of) string keys that
     // get added here.
     const scriptData = Object.create(null);
+    // Tracks how many times each "TypeName::methodName" has been seen so that
+    // overloads are numbered _0, _1, _2 … in encounter order rather than
+    // suffixed with their raw pointer values.
+    const overloadCounters = new Map();
     const metadataReader = new _utils_binary__WEBPACK_IMPORTED_MODULE_1__.BinaryReader(metadata.buffer);
     // Build index lookups once; the previous .find() inside the inner loops was
     // O(typeDefs * methodDefs) per image and is the largest hot-loop cost here.
@@ -928,16 +932,27 @@ function createIl2CppContext(buffer, metadata, referencedAssemblies) {
                 const methodDef = methodDefsByIndex.get(l);
                 if (!methodDef)
                     continue;
-                let methodName = getStringFromIndex(metadataReader, stringOffset, methodDef.nameIndex);
+                const methodName = getStringFromIndex(metadataReader, stringOffset, methodDef.nameIndex);
                 const methodPointerIndex = methodDef.token & 0x00ffffff;
                 const ptr = ptrs[methodPointerIndex - 1];
-                if (typeBucket[methodName] !== undefined) {
-                    const ptrRef = typeBucket[methodName];
-                    delete typeBucket[methodName];
-                    typeBucket[methodName + "_" + ptrRef] = ptrRef;
-                    methodName = `${methodName}_${ptr}`;
+                const overloadKey = `${fullTypeName}::${methodName}`;
+                const overloadCount = (_b = overloadCounters.get(overloadKey)) !== null && _b !== void 0 ? _b : 0;
+                overloadCounters.set(overloadKey, overloadCount + 1);
+                if (overloadCount === 0) {
+                    // First encounter — store under plain name for now.
+                    typeBucket[methodName] = ptr;
                 }
-                typeBucket[methodName] = ptr;
+                else if (overloadCount === 1) {
+                    // Second encounter — retroactively rename the first occurrence to _0.
+                    const firstPtr = typeBucket[methodName];
+                    delete typeBucket[methodName];
+                    typeBucket[`${methodName}_0`] = firstPtr;
+                    typeBucket[`${methodName}_1`] = ptr;
+                }
+                else {
+                    // Third+ encounter — just append the next index.
+                    typeBucket[`${methodName}_${overloadCount}`] = ptr;
+                }
             }
         }
     }
@@ -1356,11 +1371,21 @@ function readCodeRegistration(reader, offset) {
 }
 function readCodeGenModules(reader, offset, size) {
     console.debug("Reading CodeGen Modules");
-    reader.seek(offset);
-    const modules = [];
-    for (let i = 0; i < size; i++) {
-        modules.push(reader.readUint32());
+    if (size === 0)
+        return [];
+    // Bulk-read all module pointers in one typed-array view instead of
+    // size individual readUint32() calls.  Unity guarantees 4-byte alignment.
+    if (offset % 4 === 0 && offset + size * 4 <= reader.buffer.byteLength) {
+        const u32 = new Uint32Array(reader.buffer, offset, size);
+        const modules = new Array(size);
+        for (let i = 0; i < size; i++)
+            modules[i] = u32[i];
+        return modules;
     }
+    reader.seek(offset);
+    const modules = new Array(size);
+    for (let i = 0; i < size; i++)
+        modules[i] = reader.readUint32();
     return modules;
 }
 function readCodeGenModule(reader, offset) {
@@ -1386,12 +1411,22 @@ function readCodeGenModule(reader, offset) {
     };
 }
 function readCodeGenModuleMethodPointers(reader, offset, size) {
-    reader.seek(offset);
-    const methodPointers = [];
-    for (let i = 0; i < size; i++) {
-        methodPointers.push(reader.readUint32());
+    if (size === 0)
+        return [];
+    // Bulk-read via Uint32Array view.  Avoids up to 50k+ readUint32() calls per module.
+    // Unity's WASM data layout guarantees 4-byte alignment for pointer arrays.
+    if (offset % 4 === 0 && offset + size * 4 <= reader.buffer.byteLength) {
+        const u32 = new Uint32Array(reader.buffer, offset, size);
+        const ptrs = new Array(size);
+        for (let i = 0; i < size; i++)
+            ptrs[i] = u32[i];
+        return ptrs;
     }
-    return methodPointers;
+    reader.seek(offset);
+    const ptrs = new Array(size);
+    for (let i = 0; i < size; i++)
+        ptrs[i] = reader.readUint32();
+    return ptrs;
 }
 function getSectionHelper(length, memoryBuffer, bssStart, methodCount, imageCount) {
     const exec = {
@@ -1452,19 +1487,36 @@ class SectionHelper {
             const dataSec = this.data[i];
             const start = dataSec.offset;
             const end = Math.min(dataSec.offsetEnd, bufLen) - 4;
-            // Use a u32 view aligned on the data section start. We deliberately stride
-            // by 4 (the same as the original) so the index is identical to a linear scan.
             const map = new Map();
-            // DataView keeps endianness explicit; build it on the offset range we'll scan.
-            const view = new DataView(this.memoryBuffer);
-            for (let position = start; position <= end; position += 4) {
-                const v = view.getUint32(position, true);
-                const existing = map.get(v);
-                if (existing) {
-                    existing.push(position);
+            // Uint32Array typed access is faster than DataView.getUint32 per element
+            // because it avoids per-call endianness checks and V8 can vectorize the loop.
+            // start is always 1024 (set in getSectionHelper) so alignment is guaranteed.
+            if (start % 4 === 0 && end >= start) {
+                const count = Math.floor((end - start) / 4) + 1;
+                const u32view = new Uint32Array(this.memoryBuffer, start, count);
+                for (let j = 0; j < count; j++) {
+                    const v = u32view[j];
+                    const position = start + j * 4;
+                    const existing = map.get(v);
+                    if (existing) {
+                        existing.push(position);
+                    }
+                    else {
+                        map.set(v, [position]);
+                    }
                 }
-                else {
-                    map.set(v, [position]);
+            }
+            else {
+                const view = new DataView(this.memoryBuffer);
+                for (let position = start; position <= end; position += 4) {
+                    const v = view.getUint32(position, true);
+                    const existing = map.get(v);
+                    if (existing) {
+                        existing.push(position);
+                    }
+                    else {
+                        map.set(v, [position]);
+                    }
                 }
             }
             indexes.push(map);
@@ -1476,7 +1528,7 @@ class SectionHelper {
         for (let i = 0; i < secs.length; i++) {
             const sec = secs[i];
             this.memoryReader.seek(sec.offset);
-            const buff = this.memoryReader.readUint8Array(sec.offsetEnd - sec.offset);
+            const buff = this.memoryReader.readUint8ArrayView(sec.offsetEnd - sec.offset);
             const matches = (0,_utils__WEBPACK_IMPORTED_MODULE_3__.patternSearch)(buff, SectionHelper.featureBytes);
             for (let j = 0; j < matches.length; j++) {
                 const dllva = matches[j] + sec.address;
@@ -2008,7 +2060,7 @@ class Runtime {
             // parsing/loading steps is converted into a Promise rejection. Previously
             // the executor was `async` directly, which swallowed synchronous errors.
             (() => __awaiter(this, void 0, void 0, function* () {
-                var _a, _b, _c;
+                var _a, _b, _c, _d;
                 this.logger.debug("handling buffer");
                 if (!importObject)
                     importObject = {};
@@ -2053,9 +2105,11 @@ class Runtime {
                     var j = 0, hookLen = usePlugin.hooks.length;
                     while (j < hookLen) {
                         const useHook = usePlugin.hooks[j];
-                        useHook.tableIndex = this.getTableIndex(useHook.typeName, useHook.methodName);
+                        useHook.tableIndex = this.getTableIndex(useHook.typeName, useHook.methodName, useHook.overloadIndex);
                         if (useHook.tableIndex === -1) {
-                            this.logger.warn("Hook '%s::%s' skipped — method not found in scriptData", useHook.typeName, useHook.methodName);
+                            this.logger.warn(useHook.overloadIndex !== undefined
+                                ? "Hook '%s::%s' (overload %d) skipped — method not found in scriptData"
+                                : "Hook '%s::%s' skipped — method not found in scriptData", useHook.typeName, useHook.methodName, useHook.overloadIndex);
                             ++j;
                             continue;
                         }
@@ -2066,6 +2120,14 @@ class Runtime {
                             continue;
                         }
                         const injectName = useHook.typeName + "xx" + useHook.methodName + (0,_utils__WEBPACK_IMPORTED_MODULE_4__.makeId)(8);
+                        const lookupKey = useHook.params.join(",") + "|" + ((_b = useHook.returnType) !== null && _b !== void 0 ? _b : "");
+                        const injectType = (_c = wasmTypeIndex.get(lookupKey)) !== null && _c !== void 0 ? _c : -1;
+                        if (injectType === -1) {
+                            this.logger.warn("Hook '%s::%s' — no WASM type matches signature (%s) -> %s. " +
+                                "Check that params/returnType exactly match the IL2CPP method's WASM signature " +
+                                "(instance methods typically have an implicit i32 'this' as the first param). " +
+                                "The hook import will use type index -1 which will cause WebAssembly validation to fail.", useHook.typeName, useHook.methodName, useHook.params.join(", ") || "void", (_d = useHook.returnType) !== null && _d !== void 0 ? _d : "void");
+                        }
                         // Capture `this` as a local so the closures don't have to traverse
                         // an arrow's lexical `this` per call.
                         const runtime = this;
@@ -2175,8 +2237,6 @@ class Runtime {
                         }
                         importObject.env = importObject.env || {};
                         importObject.env[injectName] = injectFunc;
-                        const lookupKey = useHook.params.join(",") + "|" + ((_b = useHook.returnType) !== null && _b !== void 0 ? _b : "");
-                        const injectType = (_c = wasmTypeIndex.get(lookupKey)) !== null && _c !== void 0 ? _c : -1;
                         const replacementFuncIndex = wail.addImportEntry({
                             moduleStr: "env",
                             fieldStr: injectName,
@@ -2195,24 +2255,17 @@ class Runtime {
                 this.resolveIl2CppFunctions(importObject);
                 this.exportIl2CppFunctions(wail);
                 // Build the callTarget -> hookIndex map ONCE outside the per-instruction
-                // callback. The previous version remapped oldFuncIndexes on every single
-                // OP_CALL the parser saw — millions of times for non-trivial games.
+                // callback.  setCallHookData stores it on the parser for inline lookup
+                // during _readInstruction — no per-OP_CALL BufferReader allocation.
                 const callTargetToHookIndex = new Map();
                 for (let h = 0; h < oldFuncIndexes.length; h++) {
                     callTargetToHookIndex.set(oldFuncIndexes[h].i32(), h);
                 }
-                wail.addInstructionParser(_wail__WEBPACK_IMPORTED_MODULE_5__.OP_CALL, (instrBytes) => {
-                    const reader = new _wail__WEBPACK_IMPORTED_MODULE_5__.BufferReader(instrBytes);
-                    const opcode = reader.readUint8();
-                    const callTarget = reader.readVarUint32();
-                    const workingIndex = callTargetToHookIndex.get(callTarget);
-                    if (workingIndex !== undefined) {
-                        const workingHook = this.getHookByIndex(workingIndex);
-                        if (workingHook)
-                            workingHook.applied = true;
-                        return new Uint8Array([opcode, ...(0,_wail__WEBPACK_IMPORTED_MODULE_5__.VarUint32ToArray)(replacementFuncIndexes[workingIndex].i32())]);
-                    }
-                    return instrBytes;
+                const runtime = this;
+                wail.setCallHookData(callTargetToHookIndex, (hookIdx) => replacementFuncIndexes[hookIdx].i32(), (hookIdx) => {
+                    const hook = runtime.getHookByIndex(hookIdx);
+                    if (hook)
+                        hook.applied = true;
                 });
                 wail.parse();
                 function makeWasmFunc(params, results, jsImpl) {
@@ -2464,11 +2517,12 @@ class Runtime {
         }
         fn(addr);
     }
-    getTableIndex(targetClass, targetMethod) {
+    getTableIndex(targetClass, targetMethod, overloadIndex) {
         var _a;
         if (!((_a = this.il2CppContext) === null || _a === void 0 ? void 0 : _a.scriptData[targetClass]))
             return -1;
-        const result = this.il2CppContext.scriptData[targetClass][targetMethod];
+        const key = overloadIndex !== undefined ? `${targetMethod}_${overloadIndex}` : targetMethod;
+        const result = this.il2CppContext.scriptData[targetClass][key];
         if (!result)
             return -1;
         return result;
@@ -2530,6 +2584,7 @@ class ModkitPlugin {
             methodName: target.methodName,
             params: target.params,
             returnType: target.returnType,
+            overloadIndex: target.overloadIndex,
             applied: false,
             enabled: true,
             kind,
@@ -2648,7 +2703,7 @@ class ValueWrapper {
     getClassName() {
         var _a;
         if (this._result === 0) {
-            moduleLogger.warn("ValueWrapper.getClassName: called on a null pointer (0)");
+            console.trace("[UnityWebModkit] ValueWrapper.getClassName: called on a null pointer (0)");
             return null;
         }
         const g = requireGame("ValueWrapper.getClassName");
@@ -3243,14 +3298,11 @@ class WebData {
 /***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
 
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
-/* harmony export */   BufferReader: () => (/* binding */ BufferReader),
-/* harmony export */   OP_CALL: () => (/* binding */ OP_CALL),
 /* harmony export */   SECTION_ELEMENT: () => (/* binding */ SECTION_ELEMENT),
 /* harmony export */   SECTION_TYPE: () => (/* binding */ SECTION_TYPE),
-/* harmony export */   VarUint32ToArray: () => (/* binding */ VarUint32ToArray),
 /* harmony export */   WailParser: () => (/* binding */ WailParser)
 /* harmony export */ });
-/* unused harmony exports SECTION_CODE, WailVariable */
+/* unused harmony exports SECTION_CODE, OP_CALL, VarUint32ToArray, WailVariable, BufferReader */
 /**
 Copyright 2019 Jack Baker
 
@@ -4064,11 +4116,11 @@ const BufferReader = class {
     this.outBuffer = null;
 
     if (typeof buffer !== "undefined") {
-      this.inBuffer = new Uint8Array(buffer);
+      // Avoid copying when the caller already has a Uint8Array.
+      // new Uint8Array(existingUint8Array) copies every byte; just assign instead.
+      this.inBuffer = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
 
-      // Allocate an ArrayBuffer larger than original ArrayBuffer
-      // We'll create a larger array later if necessary
-      this.outBuffer = new Uint8Array(buffer.length * 2);
+      this.outBuffer = new Uint8Array(this.inBuffer.length * 2);
     } else {
       this.outBuffer = new Uint8Array(1);
     }
@@ -4084,6 +4136,43 @@ const BufferReader = class {
     this.inBuffer = new Uint8Array(buffer);
 
     this.outBuffer = new Uint8Array(this.inBuffer.length * 2);
+  }
+
+  // Reinitialise for reuse without allocating a new output buffer.
+  // If the new input is larger than the current output buffer can hold (2×),
+  // the output buffer is reallocated; otherwise it is reused.
+  reset(newInput) {
+    this.inBuffer = newInput;
+    this.inPos = 0;
+    this._copyPos = 0;
+    this._anchor = null;
+    const needed = newInput.length * 2;
+    if (!this.outBuffer || this.outBuffer.length < needed) {
+      this.outBuffer = new Uint8Array(needed);
+    }
+    this.outPos = 0;
+  }
+
+  // Write a VarUint32 (LEB128) value directly to outBuffer without creating
+  // an intermediate array.  Grows outBuffer if needed.
+  writeVarUint32(val) {
+    do {
+      while (this.outPos >= this.outBuffer.length) this.resize();
+      const b = val & 0x7f;
+      val >>>= 7;
+      this.outBuffer[this.outPos++] = val > 0 ? (b | 0x80) : b;
+    } while (val > 0);
+    this.updateCopyPosition();
+  }
+
+  // Write a contiguous slice [srcOffset, srcOffset+length) of src directly
+  // to outBuffer.  Avoids the intermediate .slice() that copyBuffer needs when
+  // called with a Uint8Array.
+  writeDirectBytes(src, srcOffset, length) {
+    while (this.outPos + length > this.outBuffer.length) this.resize();
+    this.outBuffer.set(src.subarray(srcOffset, srcOffset + length), this.outPos);
+    this.outPos += length;
+    this.updateCopyPosition();
   }
 
   resize() {
@@ -4112,17 +4201,19 @@ const BufferReader = class {
   }
 
   readVarUint32() {
-    let result = 0;
-    let shift = 0;
-
-    let currentByte;
-
+    // Inline single-byte fast path: the vast majority of WASM LEB128 operands
+    // (small local indices, function counts, short constants) fit in one byte.
+    // Skipping the loop setup saves ~70% of the work for those values.
+    const b0 = this.inBuffer[this.inPos++];
+    if (!(b0 & 0x80)) return b0;
+    let result = b0 & 0x7f;
+    let shift = 7;
+    let byte;
     do {
-      currentByte = this.readUint8();
-      result |= (currentByte & 0x7f) << shift;
+      byte = this.inBuffer[this.inPos++];
+      result |= (byte & 0x7f) << shift;
       shift += 7;
-    } while (currentByte & 0x80);
-
+    } while (byte & 0x80);
     return result;
   }
 
@@ -4205,11 +4296,12 @@ const BufferReader = class {
   commitBytes() {
     const len = this.inPos - this._copyPos;
     if (len === 0) return;
-    while (this.outPos + len > this.outBuffer.length) {
-      this.resize();
+    while (this.outPos + len > this.outBuffer.length) this.resize();
+    // Fast path for the most common case (single-byte no-arg instructions).
+    if (len === 1) {
+      this.outBuffer[this.outPos++] = this.inBuffer[this._copyPos++];
+      return;
     }
-    // Bulk byte copy — was a per-byte assignment loop, which on a typical
-    // CODE section runs into the tens of millions of iterations.
     this.outBuffer.set(this.inBuffer.subarray(this._copyPos, this.inPos), this.outPos);
     this.outPos += len;
     this._copyPos = this.inPos;
@@ -4241,7 +4333,11 @@ const BufferReader = class {
   }
 
   write() {
-    return this.outBuffer.slice(0, this.outPos);
+    // subarray is a zero-copy view; callers either pass it to copyBuffer (which
+    // copies) or to WebAssembly.instantiate (which also copies internally).
+    // There is no risk of the underlying buffer being mutated after this call
+    // since the reader is not used again.
+    return this.outBuffer.subarray(0, this.outPos);
   }
 };
 
@@ -4277,6 +4373,20 @@ class WailParser extends BufferReader {
 
     this._globalInstructionCallback = null;
     this._instructionCallbacks = {};
+    // Fast-path flag: if false, the instruction callback dispatch is skipped
+    // entirely per instruction — saves a property lookup on every opcode.
+    this._hasInstructionCallbacks = false;
+
+    // Inline call-hook data — avoids per-OP_CALL BufferReader allocation and
+    // outBuffer.slice() that the generic _instructionCallbacks path incurs.
+    this._callHookMap = null;
+    this._callHookGetReplacement = null;
+    this._callHookOnApplied = null;
+
+    // Pre-computed flag: true only when per-function callbacks or existingEntries
+    // are registered. Lets _readFunction skip 3 property lookups per function when
+    // neither feature is used (the common case in UWMK).
+    this._hasSpecialFunctions = false;
 
     this._sectionOptions = {};
 
@@ -4976,6 +5086,7 @@ class WailParser extends BufferReader {
 
     this._sectionOptions[SECTION_CODE].existingEntries.push(savedEntry);
 
+    this._hasSpecialFunctions = true;
     this._optionalSectionFlags |= 1 << SECTION_IMPORT;
     this._optionalSectionFlags |= 1 << SECTION_CODE;
   }
@@ -5031,6 +5142,7 @@ class WailParser extends BufferReader {
       this._functionCallbacks.push(callbackObj);
     }
 
+    this._hasSpecialFunctions = true;
     this._optionalSectionFlags |= 1 << SECTION_IMPORT;
     this._optionalSectionFlags |= 1 << SECTION_CODE;
   }
@@ -5049,6 +5161,22 @@ class WailParser extends BufferReader {
       this._instructionCallbacks[opcode] = callback;
     }
 
+    this._hasInstructionCallbacks = true;
+    this._optionalSectionFlags |= 1 << SECTION_CODE;
+  }
+
+  // High-performance alternative to addInstructionParser(OP_CALL, ...).
+  // Stores the hook map directly on the parser so the OP_CALL case in
+  // _readInstruction can do an inline Map lookup without allocating a
+  // BufferReader or slicing the output buffer per call instruction.
+  //
+  //   hookMap       — Map<adjustedCallTarget, hookArrayIndex>
+  //   getReplacement(hookIdx) — returns the replacement function index (number)
+  //   onApplied(hookIdx)      — called when a hook is applied (may be null)
+  setCallHookData(hookMap, getReplacement, onApplied) {
+    this._callHookMap = hookMap;
+    this._callHookGetReplacement = getReplacement;
+    this._callHookOnApplied = onApplied;
     this._optionalSectionFlags |= 1 << SECTION_CODE;
   }
 
@@ -5125,7 +5253,7 @@ class WailParser extends BufferReader {
     // Skip over removed sections
     if (this._removeSectionIds.includes(id)) {
       payloadLen = this.readVarUint32();
-      this.readBytes(payloadLen);
+      this.inPos += payloadLen;   // advance past payload without allocating a copy
 
       this.updateCopyPosition();
 
@@ -5209,7 +5337,7 @@ class WailParser extends BufferReader {
     // Skip over the section if the user has not requested we parse it
     if (!parseSection) {
       payloadLen = this.readVarUint32();
-      this.readBytes(payloadLen);
+      this.inPos += payloadLen;   // advance past payload; commitBytes next round copies it verbatim
 
       return;
     }
@@ -5335,10 +5463,12 @@ class WailParser extends BufferReader {
 
     const start = this.inPos;
     const oldCount = this.readVarUint32();
-    const end = this.inPos;
-    const oldCountLength = end - start;
-
-    const oldPayload = this.readBytes(oldPayloadLen - oldCountLength);
+    const oldCountLength = this.inPos - start;
+    const typePayloadLen = oldPayloadLen - oldCountLength;
+    const typePayloadStart = this.inPos;
+    this.inPos += typePayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(typePayloadStart, typePayloadStart + typePayloadLen);
 
     const reader = new BufferReader(oldPayload);
 
@@ -5550,8 +5680,11 @@ class WailParser extends BufferReader {
     const countStart = this.inPos;
     const oldCount = this.readVarUint32();
     const oldCountLength = this.inPos - countStart;
-
-    const oldPayload = this.readBytes(oldPayloadLen - oldCountLength);
+    const importPayloadLen = oldPayloadLen - oldCountLength;
+    const importPayloadStart = this.inPos;
+    this.inPos += importPayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(importPayloadStart, importPayloadStart + importPayloadLen);
     const reader = new BufferReader(oldPayload);
 
     const newEntries = this._sectionOptions[SECTION_IMPORT].newEntries;
@@ -5755,8 +5888,11 @@ class WailParser extends BufferReader {
     const countStart = this.inPos;
     const oldCount = this.readVarUint32();
     const oldCountLength = this.inPos - countStart;
-
-    const oldPayload = this.readBytes(oldPayloadLen - oldCountLength);
+    const funcPayloadLen = oldPayloadLen - oldCountLength;
+    const funcPayloadStart = this.inPos;
+    this.inPos += funcPayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(funcPayloadStart, funcPayloadStart + funcPayloadLen);
     const reader = new BufferReader(oldPayload);
 
     // Optimize Unity runtime check
@@ -5886,10 +6022,12 @@ class WailParser extends BufferReader {
 
     const start = this.inPos;
     const oldCount = this.readVarUint32();
-    const end = this.inPos;
-    const oldCountLength = end - start;
-
-    const oldPayload = this.readBytes(oldPayloadLen - oldCountLength);
+    const oldCountLength = this.inPos - start;
+    const globalPayloadLen = oldPayloadLen - oldCountLength;
+    const globalPayloadStart = this.inPos;
+    this.inPos += globalPayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(globalPayloadStart, globalPayloadStart + globalPayloadLen);
 
     const reader = new BufferReader(oldPayload);
 
@@ -6006,7 +6144,10 @@ class WailParser extends BufferReader {
 
     const oldPayloadLen = this.readVarUint32();
 
-    const oldPayload = this.readBytes(oldPayloadLen);
+    const exportPayloadStart = this.inPos;
+    this.inPos += oldPayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(exportPayloadStart, exportPayloadStart + oldPayloadLen);
 
     const reader = new BufferReader(oldPayload);
 
@@ -6193,10 +6334,12 @@ class WailParser extends BufferReader {
 
     const start = this.inPos;
     const oldCount = this.readVarUint32();
-    const end = this.inPos;
-    const oldCountLength = end - start;
-
-    const oldPayload = this.readBytes(oldPayloadLen - oldCountLength);
+    const oldCountLength = this.inPos - start;
+    const elemPayloadLen = oldPayloadLen - oldCountLength;
+    const elemPayloadStart = this.inPos;
+    this.inPos += elemPayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(elemPayloadStart, elemPayloadStart + elemPayloadLen);
 
     const reader = new BufferReader(oldPayload);
 
@@ -6248,10 +6391,10 @@ class WailParser extends BufferReader {
         }
       }
 
-      reader.copyBuffer(VarUint32ToArray(numElements));
+      reader.writeVarUint32(numElements);
 
       for (let i = 0; i < numElements; i++) {
-        reader.copyBuffer(VarUint32ToArray(elements[i]));
+        reader.writeVarUint32(elements[i]);
       }
 
       if (!populateThisTimeOnly) continue;
@@ -6319,7 +6462,10 @@ class WailParser extends BufferReader {
     this.commitBytes();
 
     const oldPayloadLen = this.readVarUint32();
-    const oldPayload = this.readBytes(oldPayloadLen);
+    const codePayloadStart = this.inPos;
+    this.inPos += oldPayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(codePayloadStart, codePayloadStart + oldPayloadLen);
     const reader = new BufferReader(oldPayload);
     const oldCount = reader.readVarUint32();
     const newEntries = this._sectionOptions[SECTION_CODE].newEntries;
@@ -6328,7 +6474,15 @@ class WailParser extends BufferReader {
     // Write new count once
     reader.copyBuffer(VarUint32ToArray(newCount));
 
-    const adjustedImportFuncCount = this._importFuncCount;
+    // Non-import functions always satisfy the >= importFuncCount branch in
+    // _getAdjustedFunctionIndex, so we inline the adjustment once here and
+    // eliminate 50k method calls in the hot loop.
+    const importFuncCount = this._importFuncCount;
+    const importFuncNewCount = this._importFuncNewCount;
+    const funcIndexBase = importFuncCount + importFuncNewCount;
+
+    // Cache existingEntries once — avoids 3 property lookups × 50k calls.
+    const codeExistingEntries = this._sectionOptions[SECTION_CODE].existingEntries;
 
     // Create lookup map for new entries to avoid O(n^2) search
     const newEntriesMap = new Map();
@@ -6343,11 +6497,17 @@ class WailParser extends BufferReader {
       }
     }
 
+    // Shared BufferReader instances — reset() per function instead of
+    // allocating new ones.  For games with 50k+ functions this cuts away
+    // ~100k Uint8Array allocations (and the matching 2× output buffers)
+    // which was the primary source of GC stalls during CODE section parsing.
+    const sharedHeaderReader = new BufferReader();
+    const sharedBodyReader = new BufferReader();
+
     // Hot loop — every function in the CODE section runs through this.
     // _readFunction no longer returns metadata; we just parse and rewrite.
     for (let i = 0; i < oldCount; i++) {
-      const funcIndex = this._getAdjustedFunctionIndex(adjustedImportFuncCount + i);
-      this._readFunction(reader, funcIndex);
+      this._readFunction(reader, funcIndexBase + i, sharedHeaderReader, sharedBodyReader, codeExistingEntries);
     }
 
     // Process new entries using the pre-built map
@@ -6443,14 +6603,14 @@ class WailParser extends BufferReader {
 
     const oldPayloadLen = this.readVarUint32();
 
-    // This is gross but VarUInt32s can be variable lengths (obviously).
-    // So this is an easy way to account for any possible length.
     const start = this.inPos;
     const oldCount = this.readVarUint32();
-    const end = this.inPos;
-    const oldCountLength = end - start;
-
-    const oldPayload = this.readBytes(oldPayloadLen - oldCountLength);
+    const oldCountLength = this.inPos - start;
+    const dataPayloadLen = oldPayloadLen - oldCountLength;
+    const dataPayloadStart = this.inPos;
+    this.inPos += dataPayloadLen;
+    this.updateCopyPosition();
+    const oldPayload = this.inBuffer.subarray(dataPayloadStart, dataPayloadStart + dataPayloadLen);
 
     const reader = new BufferReader(oldPayload);
 
@@ -6526,32 +6686,101 @@ class WailParser extends BufferReader {
   }
 
   // TODO Modify locals/params
-  _readFunction(reader, funcIndex) {
-    const existingEntries = this._sectionOptions[SECTION_CODE].existingEntries;
-
+  // sharedHeaderReader / sharedBodyReader are pre-allocated BufferReader instances
+  // passed in from _parseCodeSection and reset() per function, eliminating the
+  // two `new BufferReader + new Uint8Array(2×)` allocations that previously
+  // dominated GC time when parsing games with tens of thousands of functions.
+  // existingEntries is pre-fetched by _parseCodeSection to avoid repeated
+  // property lookups (this._sectionOptions[SECTION_CODE].existingEntries).
+  _readFunction(reader, funcIndex, sharedHeaderReader, sharedBodyReader, existingEntries) {
     const bodySize = reader.readVarUint32();
 
-    const bodyPayload = reader.readBytes(bodySize);
+    // Non-owning view — no copy.  reader.inPos was already advanced past the
+    // body by advancing it below; we grab the view before doing so.
+    const bodyStart = reader.inPos;
+    reader.inPos += bodySize;
+    const bodyPayload = reader.inBuffer.subarray(bodyStart, reader.inPos);
 
+    // Detect per-function modifications (rare) to decide fast vs. slow path.
+    // _hasSpecialFunctions is false when no per-function callbacks or editCodeEntry
+    // calls have been registered — short-circuits all three inner checks with one
+    // boolean read, saving ~4 property lookups × 50k functions in typical usage.
+    let needsSpecial = false;
+    if (this._hasSpecialFunctions) {
+      needsSpecial = typeof this._globalFunctionCallback === "function";
+      if (!needsSpecial && existingEntries.length > 0) {
+        for (let i = 0; i < existingEntries.length; i++) {
+          let idx = existingEntries[i].index;
+          if (idx instanceof WailVariable) idx = idx.value;
+          if (idx === funcIndex) { needsSpecial = true; break; }
+        }
+      }
+      if (!needsSpecial && this._functionCallbacks.length > 0) {
+        for (let i = 0; i < this._functionCallbacks.length; i++) {
+          let idx = this._functionCallbacks[i].index;
+          if (idx instanceof WailVariable) idx = idx.value;
+          if (idx === funcIndex) { needsSpecial = true; break; }
+        }
+      }
+    }
+
+    if (!needsSpecial) {
+      // Fast path — reuse shared readers instead of allocating fresh ones.
+      sharedHeaderReader.reset(bodyPayload);
+      const headerReader = sharedHeaderReader;
+
+      const localCount = headerReader.readVarUint32();
+      for (let i = 0; i < localCount; i++) {
+        headerReader.readVarUint32();
+        headerReader.readUint8();
+      }
+      headerReader.commitBytes();
+
+      const bodySlice = bodyPayload.subarray(headerReader.inPos);
+
+      // Ultra-fast path: if the body contains no 0x10 (OP_CALL) bytes AND there
+      // are no global-index adjustments needed, no instruction needs modification.
+      // Uint8Array.includes() is implemented in native code and is far faster than
+      // 100+ _readInstruction() calls per function body.
+      if (this._importGlobalNewCount === 0 && !bodySlice.includes(0x10)) {
+        reader.writeVarUint32(headerReader.outPos + bodySlice.length);
+        reader.writeDirectBytes(headerReader.outBuffer, 0, headerReader.outPos);
+        reader.writeDirectBytes(bodySlice, 0, bodySlice.length);
+        return;
+      }
+
+      sharedBodyReader.reset(bodySlice);
+      const bodyReader = sharedBodyReader;
+
+      while (bodyReader.inPos < bodyReader.inBuffer.length) {
+        // bodyReader.commitBytes() after each instruction was always a no-op
+        // (commitBytes at end of _readInstruction sets _copyPos = inPos).
+        this._readInstruction(bodyReader);
+      }
+
+      // Write size + header + body directly without intermediate .slice() calls.
+      reader.writeVarUint32(headerReader.outPos + bodyReader.outPos);
+      reader.writeDirectBytes(headerReader.outBuffer, 0, headerReader.outPos);
+      reader.writeDirectBytes(bodyReader.outBuffer, 0, bodyReader.outPos);
+      return;
+    }
+
+    // Slow path — per-function callbacks or existingEntries replacement.
+    // Use the same non-owning bodyPayload view; allocate fresh readers here
+    // since these cases are rare and the allocation cost is acceptable.
     const headerReader = new BufferReader(bodyPayload);
 
     const localCount = headerReader.readVarUint32();
-
-    // We no longer build a `locals` array — the previous version used it to
-    // decide whether to record `instructions` into the dead internalWasmCode
-    // path. Just advance the header reader over the local declarations.
     for (let i = 0; i < localCount; i++) {
       headerReader.readVarUint32();
       headerReader.readUint8();
     }
-
     headerReader.commitBytes();
 
     const bodyReader = new BufferReader(bodyPayload.subarray(headerReader.inPos));
 
     while (bodyReader.inPos < bodyReader.inBuffer.length) {
       this._readInstruction(bodyReader);
-      bodyReader.commitBytes();
     }
 
     let newHeader = headerReader.write();
@@ -6629,19 +6858,19 @@ class WailParser extends BufferReader {
       }
     }
 
-    let newPayloadLen = VarUint32ToArray(newHeader.length + newBody.length);
-
-    reader.copyBuffer(newPayloadLen);
-    reader.copyBuffer(newHeader);
-    reader.copyBuffer(newBody);
+    reader.writeVarUint32(newHeader.length + newBody.length);
+    reader.writeDirectBytes(newHeader, 0, newHeader.length);
+    reader.writeDirectBytes(newBody, 0, newBody.length);
 
     // No callers read the return value any more; the only reads were the
     // internalWasmCode populating path, which is gone.
   }
 
   _readInstruction(reader) {
-    reader.commitBytes();
-    reader.setAnchor();
+    // commitBytes() here was always a no-op: every caller ensures _copyPos===inPos
+    // before this call (either via copyBuffer or the previous _readInstruction's
+    // own trailing commitBytes). Removing it saves one method call per instruction.
+    if (this._hasInstructionCallbacks) reader.setAnchor();
 
     const opcode = reader.readUint8();
 
@@ -6799,13 +7028,14 @@ class WailParser extends BufferReader {
         break;
       case OP_GET_GLOBAL:
       case OP_SET_GLOBAL:
-        reader.commitBytes();
-
-        oldTarget = reader.readVarUint32();
-
-        newTarget = this._getAdjustedGlobalIndex(oldTarget);
-
-        reader.copyBuffer(VarUint32ToArray(newTarget));
+        if (this._importGlobalNewCount !== 0) {
+          reader.commitBytes();
+          oldTarget = reader.readVarUint32();
+          newTarget = this._getAdjustedGlobalIndex(oldTarget);
+          reader.writeVarUint32(newTarget);
+        } else {
+          reader.readVarUint32();   // no adjustment needed — just skip the arg
+        }
         break;
       case OP_F32_CONST:
         reader.readBytes(4);
@@ -6855,7 +7085,17 @@ class WailParser extends BufferReader {
 
         newTarget = this._getAdjustedFunctionIndex(oldTarget);
 
-        reader.copyBuffer(VarUint32ToArray(newTarget));
+        // Inline hook replacement — avoids allocating a BufferReader and
+        // slicing the output buffer (readFromAnchor) for every OP_CALL.
+        if (this._callHookMap !== null) {
+          const hookIdx = this._callHookMap.get(newTarget);
+          if (hookIdx !== undefined) {
+            newTarget = this._callHookGetReplacement(hookIdx);
+            if (this._callHookOnApplied !== null) this._callHookOnApplied(hookIdx);
+          }
+        }
+
+        reader.writeVarUint32(newTarget);
         break;
       case OP_CALL_INDIRECT:
         reader.readVarUint32();
@@ -7166,11 +7406,16 @@ class WailParser extends BufferReader {
 
     reader.commitBytes();
 
-    const cb = this._instructionCallbacks[opcode];
-    if (cb !== undefined) {
-      reader.writeAtAnchor(cb(reader.readFromAnchor()));
-    } else if (typeof this._globalInstructionCallback === "function") {
-      reader.writeAtAnchor(this._globalInstructionCallback[opcode](reader.readFromAnchor()));
+    // Only do the generic callback dispatch when someone actually registered
+    // a callback via addInstructionParser.  This saves one property lookup
+    // per instruction for the common case (no generic callbacks).
+    if (this._hasInstructionCallbacks) {
+      const cb = this._instructionCallbacks[opcode];
+      if (cb !== undefined) {
+        reader.writeAtAnchor(cb(reader.readFromAnchor()));
+      } else if (typeof this._globalInstructionCallback === "function") {
+        reader.writeAtAnchor(this._globalInstructionCallback[opcode](reader.readFromAnchor()));
+      }
     }
     // Return the opcode only (a number). Init-expression scanners in
     // GLOBAL / ELEMENT / DATA sections need to know when to stop; everyone
@@ -7251,7 +7496,7 @@ class WailParser extends BufferReader {
 /******/ 	
 /******/ 	/* webpack/runtime/getFullHash */
 /******/ 	(() => {
-/******/ 		__webpack_require__.h = () => ("4af61c34928b35111cb7")
+/******/ 		__webpack_require__.h = () => ("ce547ea7e5e8bbc15661")
 /******/ 	})();
 /******/ 	
 /******/ 	/* webpack/runtime/hasOwnProperty shorthand */
